@@ -645,18 +645,46 @@ impl UtilityReducer for SampledReplyUtilityReducer {
     }
 }
 
-/// Defensive ceiling on the successor edges one decision may memoize.
+/// Ceiling on the child `GameState` snapshots one decision's successor memo
+/// may retain. This is the memo's memory budget: every successful stored edge
+/// keeps one full snapshot alive until the decision ends.
 ///
-/// One `SearchBudget` allows at most 96 node ticks per rung, a decision runs at
-/// most two rungs with interior search (rung 0 only evaluates the root
-/// candidates) and a node expands at most `max_branching` (5) edges, so the
-/// beam walks roughly 960 edges that the rungs largely share; rollout sampling
-/// and quiescence chains add a handful per leaf. 2048 is half of `TT_CAPACITY`
-/// and is not expected to bind on any preset. Retention is first-come, which
-/// keeps the shallow edges every rung re-walks. Past the ceiling an edge is
-/// simulated on every visit and its child is untracked, which is exactly the
-/// path search took before the memo existed.
-const SUCCESSOR_MEMO_CAPACITY: usize = 2048;
+/// Retention is first-come, which keeps the shallow edges every rung
+/// re-walks. Once the ceiling is reached an edge is simulated on every visit
+/// and its child is untracked, which is exactly the path search took before
+/// the memo existed, so the ceiling changes cost and never the result.
+///
+/// 16 is a measured choice, not a derived one. Workload: `ai-duel`, profiling
+/// build, Hard, red against green, seed 7, `--batch 4`, compared with the
+/// build that has no memo (average game 5.36 s, peak RSS 1.50 GB):
+///
+/// | ceiling | average game | peak RSS |
+/// |---------|--------------|----------|
+/// | 0       | -7%          | +0-1%    |
+/// | 8       | -12%         | +1.5%    |
+/// | 16      | -14%         | +3%      |
+/// | 32      | -16%         | +6%      |
+/// | 64      | -17%         | +13%     |
+/// | 128     | -17%         | +16%     |
+/// | 256     | -16%         | +31%     |
+/// | 2048    | -15%         | +65%     |
+///
+/// Without a binding ceiling one decision retained up to 528 snapshots and 462
+/// decision contexts, and that retention is the whole RSS increase. 41% of
+/// the successor hits land on the first 16 snapshots a decision admits, 64% on
+/// the first 32 and 85% on the first 64. At ceiling 0 no position below a
+/// root is tracked. The same runs produced byte-identical game output at
+/// every ceiling. Run-to-run spread on the average game is about two points:
+/// a second set of three alternating runs at 16 measured -12%.
+const SUCCESSOR_STATE_CAPACITY: usize = 16;
+
+/// Defensive ceiling on the successor edges one decision may memoize, failed
+/// applies included. A failed edge retains no snapshot, only its `GameAction`,
+/// so it is not charged to `SUCCESSOR_STATE_CAPACITY`; this separate ceiling
+/// keeps the edge lists bounded even for a search that keeps failing. The
+/// workload measured for `SUCCESSOR_STATE_CAPACITY` stored no failed apply at
+/// all, so 256 is headroom rather than a tuned value.
+const SUCCESSOR_EDGE_CAPACITY: usize = 256;
 
 /// Identity of one position inside a single decision's search.
 ///
@@ -686,8 +714,16 @@ pub struct SearchMemoWitness {
     pub context_hits: u32,
     /// Decision-context requests that ran the engine's context builder.
     pub context_builds: u32,
-    /// Highest number of successor edges held by the memo at once.
+    /// Highest number of successor edges held by the memo at once, failed
+    /// applies included. Not a measure of memory: see `peak_retained_states`.
     pub peak_successor_edges: usize,
+    /// Highest number of child `GameState` snapshots held by the successor
+    /// memo at once (one per stored successful edge). This is the quantity
+    /// the memo's capacity bounds.
+    pub peak_retained_states: usize,
+    /// Highest number of decision contexts held by the per-position memo at
+    /// once, roots included.
+    pub peak_node_contexts: usize,
 }
 
 /// Where quiescence currently stands. It starts by borrowing the caller's
@@ -803,16 +839,30 @@ pub struct PlannerServices<'a> {
     /// decision — so nothing crosses determinized samples or decisions.
     successors: HashMap<SearchNodeId, Vec<(GameAction, TrackedSuccessor)>>,
     /// Number of edges currently held by `successors`, failed applies included.
+    /// Never exceeds `successor_edge_capacity`.
     stored_successor_edges: usize,
-    /// Next unissued [`SearchNodeId`]. Ids only ever increase; the count is
-    /// bounded by `successor_capacity` plus the number of roots.
+    /// Number of child snapshots currently held by `successors`: its
+    /// successful edges. Never exceeds `successor_state_capacity`.
+    retained_successor_states: usize,
+    /// Next unissued [`SearchNodeId`]. Ids only ever increase; one is issued
+    /// per root and one per retained snapshot, so the count is bounded by
+    /// `successor_state_capacity` plus the number of roots.
     next_search_node: u32,
-    /// Ceiling on `stored_successor_edges`, initialised from
-    /// `SUCCESSOR_MEMO_CAPACITY`. A field so tests can lower it; `0` turns the
+    /// Ceiling on `retained_successor_states`, initialised from
+    /// `SUCCESSOR_STATE_CAPACITY`. Once it is reached no further edge is
+    /// stored, successful or not. A field so tests can lower it; `0` turns the
     /// successor memo off, which leaves every position below a root untracked.
-    pub(crate) successor_capacity: usize,
+    pub(crate) successor_state_capacity: usize,
+    /// Ceiling on `stored_successor_edges`, initialised from
+    /// `SUCCESSOR_EDGE_CAPACITY`. A field so tests can lower it.
+    successor_edge_capacity: usize,
     /// Exact per-position decision contexts, keyed by tracked position. Keyed
-    /// lookup only, never iterated.
+    /// lookup only, never iterated. Holds at most
+    /// `successor_state_capacity + 1` entries: a key is a tracked child (one
+    /// per retained snapshot, so at most `successor_state_capacity` of them)
+    /// or a root, and production search issues one root per decision.
+    /// `exact_decision_context` enforces the same ceiling on insert, so the
+    /// bound also holds for a caller that issues more roots.
     node_contexts: HashMap<SearchNodeId, Arc<AiDecisionContext>>,
     /// Witness counters for the memos above. Not engine perf counters; local
     /// evidence that repeated work was actually skipped, used by the memo
@@ -900,8 +950,10 @@ impl<'a> PlannerServices<'a> {
             rung_stats: Vec::new(),
             successors: HashMap::new(),
             stored_successor_edges: 0,
+            retained_successor_states: 0,
             next_search_node: 0,
-            successor_capacity: SUCCESSOR_MEMO_CAPACITY,
+            successor_state_capacity: SUCCESSOR_STATE_CAPACITY,
+            successor_edge_capacity: SUCCESSOR_EDGE_CAPACITY,
             node_contexts: HashMap::new(),
             memo_witness: SearchMemoWitness::default(),
         }
@@ -962,6 +1014,11 @@ impl<'a> PlannerServices<'a> {
     /// one builds every time. The builder reads nothing but the state, so the
     /// memoized value equals a fresh build. Never reads or writes
     /// `candidate_cache`. `node`, when given, must identify `state`.
+    ///
+    /// The memo holds at most `successor_state_capacity + 1` contexts (every
+    /// tracked child plus one root). A tracked position past that ceiling,
+    /// which takes more than one root to reach, is built on every request like
+    /// an untracked one.
     fn exact_decision_context(
         &mut self,
         node: Option<SearchNodeId>,
@@ -976,7 +1033,13 @@ impl<'a> PlannerServices<'a> {
         self.memo_witness.context_builds = self.memo_witness.context_builds.saturating_add(1);
         let ctx = Arc::new(build_decision_context(state));
         if let Some(node) = node {
-            self.node_contexts.insert(node, Arc::clone(&ctx));
+            if self.node_contexts.len() <= self.successor_state_capacity {
+                self.node_contexts.insert(node, Arc::clone(&ctx));
+                self.memo_witness.peak_node_contexts = self
+                    .memo_witness
+                    .peak_node_contexts
+                    .max(self.node_contexts.len());
+            }
         }
         ctx
     }
@@ -1003,8 +1066,13 @@ impl<'a> PlannerServices<'a> {
     /// - Tracked hit: returns the stored result (`None` for a stored failure)
     ///   without calling `simulate`.
     /// - Tracked miss: simulates and stores the result, failures included,
-    ///   unless the memo is at `successor_capacity`; then nothing is stored and
-    ///   the child is untracked.
+    ///   unless the memo already retains `successor_state_capacity` child
+    ///   snapshots or holds `successor_edge_capacity` edges; then nothing is
+    ///   stored and the child is untracked.
+    ///
+    /// Only a stored success retains a snapshot and counts toward
+    /// `successor_state_capacity`. A stored failure counts toward
+    /// `successor_edge_capacity` alone.
     pub(crate) fn successor(
         &mut self,
         parent: Option<SearchNodeId>,
@@ -1029,12 +1097,15 @@ impl<'a> PlannerServices<'a> {
         self.memo_witness.successor_simulations =
             self.memo_witness.successor_simulations.saturating_add(1);
         let simulated = simulate();
-        if self.stored_successor_edges >= self.successor_capacity {
+        if self.retained_successor_states >= self.successor_state_capacity
+            || self.stored_successor_edges >= self.successor_edge_capacity
+        {
             return simulated.map(|state| (None, Arc::new(state)));
         }
         let tracked: TrackedSuccessor = simulated.map(|state| {
             let child = SearchNodeId(self.next_search_node);
             self.next_search_node = self.next_search_node.wrapping_add(1);
+            self.retained_successor_states += 1;
             (child, Arc::new(state))
         });
         self.successors
@@ -1046,6 +1117,10 @@ impl<'a> PlannerServices<'a> {
             .memo_witness
             .peak_successor_edges
             .max(self.stored_successor_edges);
+        self.memo_witness.peak_retained_states = self
+            .memo_witness
+            .peak_retained_states
+            .max(self.retained_successor_states);
         tracked.map(|(child, state)| (Some(child), state))
     }
 
@@ -3901,6 +3976,7 @@ mod tests {
         assert_eq!(services.memo_witness.successor_hits, 1);
         assert_eq!(services.memo_witness.successor_simulations, 1);
         assert_eq!(services.memo_witness.peak_successor_edges, 1);
+        assert_eq!(services.memo_witness.peak_retained_states, 1);
         assert!(first_child.is_some(), "a stored success is tracked");
         assert_eq!(first_child, second_child);
         assert!(
@@ -3943,10 +4019,12 @@ mod tests {
         assert_eq!(services.memo_witness.successor_hits, 0);
         assert_eq!(services.memo_witness.successor_simulations, 2);
         assert_eq!(services.memo_witness.peak_successor_edges, 0);
+        assert_eq!(services.memo_witness.peak_retained_states, 0);
         assert!(services.successors.is_empty());
     }
 
-    /// T3: a failed apply at a tracked parent is memoized as a failure.
+    /// T3: a failed apply at a tracked parent is memoized as a failure, which
+    /// is an edge that retains no state.
     #[test]
     fn successor_memo_remembers_a_failed_apply() {
         let state = make_state_with_land();
@@ -3971,6 +4049,7 @@ mod tests {
         assert_eq!(runs.get(), 1, "the stored failure answers the revisit");
         assert_eq!(services.memo_witness.successor_hits, 1);
         assert_eq!(services.memo_witness.peak_successor_edges, 1);
+        assert_eq!(services.memo_witness.peak_retained_states, 0);
     }
 
     /// T4 (hostile): two roots on different states never share an edge, even
@@ -4008,15 +4087,16 @@ mod tests {
         );
     }
 
-    /// T5: past `successor_capacity` an edge is simulated on every visit and
-    /// its child is untracked, while the edges stored earlier keep hitting.
+    /// T5: once `successor_state_capacity` snapshots are retained an edge is
+    /// simulated on every visit and its child is untracked, while the edges
+    /// stored earlier keep hitting. The witness reports the bound binding.
     #[test]
     fn successor_memo_falls_open_past_capacity() {
         let state = make_state_with_land();
         let config = create_config(AiDifficulty::VeryHard, Platform::Native);
         let policies = PolicyRegistry::default();
         let mut services = hard_services(&config, &policies);
-        services.successor_capacity = 1;
+        services.successor_state_capacity = 1;
         let pass = pass_candidate();
         let other = build_decision_context(&state)
             .candidates
@@ -4044,6 +4124,10 @@ mod tests {
         );
         assert_eq!(services.memo_witness.successor_hits, 0);
         assert_eq!(services.memo_witness.peak_successor_edges, 1);
+        assert_eq!(
+            services.memo_witness.peak_retained_states, 1,
+            "the retained snapshots stop at the capacity"
+        );
 
         let (again, _) = services
             .successor(Some(root), &pass.action, || apply_candidate(&state, &pass))
@@ -4051,6 +4135,167 @@ mod tests {
         assert_eq!(again, stored_child);
         assert_eq!(services.memo_witness.successor_hits, 1);
         assert_eq!(services.memo_witness.successor_simulations, 3);
+    }
+
+    /// T5b: a stored failure retains no snapshot, so it takes none of the
+    /// retained-state budget: with room for one snapshot, a success requested
+    /// after a failure is still tracked. Once that snapshot is retained the
+    /// memo is closed to every new edge, a failing one included. Reach-guard:
+    /// the failure and the success are both stored, as their revisits hit.
+    #[test]
+    fn failed_apply_takes_no_retained_state_budget() {
+        let state = make_state_with_land();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = hard_services(&config, &policies);
+        services.successor_state_capacity = 1;
+        let pass = pass_candidate();
+        let illegal = inapplicable_candidate();
+        let root = services.new_search_root();
+
+        assert!(services
+            .successor(Some(root), &illegal.action, || {
+                apply_candidate(&state, &illegal)
+            })
+            .is_none());
+        assert_eq!(services.memo_witness.peak_successor_edges, 1);
+        assert_eq!(services.memo_witness.peak_retained_states, 0);
+
+        let (child, _) = services
+            .successor(Some(root), &pass.action, || apply_candidate(&state, &pass))
+            .expect("reach-guard: pass applies");
+        let child = child.expect("the failure left the whole state budget free");
+        assert_eq!(services.memo_witness.peak_successor_edges, 2);
+        assert_eq!(services.memo_witness.peak_retained_states, 1);
+
+        assert!(services
+            .successor(Some(root), &illegal.action, || {
+                apply_candidate(&state, &illegal)
+            })
+            .is_none());
+        services
+            .successor(Some(root), &pass.action, || apply_candidate(&state, &pass))
+            .expect("the stored success is still there");
+        assert_eq!(
+            services.memo_witness.successor_hits, 2,
+            "reach-guard: both edges were stored"
+        );
+        assert_eq!(services.memo_witness.successor_simulations, 2);
+
+        // The budget is spent: a new failing edge below the tracked child is
+        // simulated on every visit and never stored.
+        for _ in 0..2 {
+            assert!(services
+                .successor(Some(child), &illegal.action, || {
+                    apply_candidate(&state, &illegal)
+                })
+                .is_none());
+        }
+        assert_eq!(services.memo_witness.successor_simulations, 4);
+        assert_eq!(services.memo_witness.successor_hits, 2);
+        assert_eq!(services.memo_witness.peak_successor_edges, 2);
+        assert_eq!(services.memo_witness.peak_retained_states, 1);
+    }
+
+    /// T5c: failed applies are bounded by `successor_edge_capacity` on their
+    /// own, so a search that only ever fails cannot grow the edge lists
+    /// without limit, and reaching that ceiling closes the memo to successes
+    /// too. Reach-guard: the first failure is stored and answers its revisit.
+    #[test]
+    fn failed_applies_stop_at_the_edge_capacity() {
+        let state = make_state_with_land();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = hard_services(&config, &policies);
+        services.successor_edge_capacity = 1;
+        let pass = pass_candidate();
+        let illegal = inapplicable_candidate();
+        let first_root = services.new_search_root();
+        let second_root = services.new_search_root();
+
+        for _ in 0..2 {
+            assert!(services
+                .successor(Some(first_root), &illegal.action, || {
+                    apply_candidate(&state, &illegal)
+                })
+                .is_none());
+        }
+        assert_eq!(
+            services.memo_witness.successor_hits, 1,
+            "reach-guard: the first failure is stored"
+        );
+
+        for _ in 0..2 {
+            assert!(services
+                .successor(Some(second_root), &illegal.action, || {
+                    apply_candidate(&state, &illegal)
+                })
+                .is_none());
+        }
+        let (child, _) = services
+            .successor(Some(second_root), &pass.action, || {
+                apply_candidate(&state, &pass)
+            })
+            .expect("reach-guard: pass applies");
+        assert!(child.is_none(), "a full edge list tracks no new child");
+        assert_eq!(services.memo_witness.successor_hits, 1);
+        assert_eq!(services.memo_witness.successor_simulations, 4);
+        assert_eq!(services.memo_witness.peak_successor_edges, 1);
+        assert_eq!(services.memo_witness.peak_retained_states, 0);
+    }
+
+    /// T5d: the decision-context memo holds at most
+    /// `successor_state_capacity + 1` contexts however many positions are
+    /// tracked. One root and one retained child fill it at capacity 1; a
+    /// second root, the only way to track a further position, is then built on
+    /// every request. Reach-guard: the two stored contexts answer their
+    /// revisits from the memo.
+    #[test]
+    fn context_memo_stays_within_the_retained_state_bound() {
+        let state = make_state_with_land();
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        let policies = PolicyRegistry::default();
+        let mut services = hard_services(&config, &policies);
+        services.successor_state_capacity = 1;
+        let pass = pass_candidate();
+        let root = services.new_search_root();
+        let (child, child_state) = services
+            .successor(Some(root), &pass.action, || apply_candidate(&state, &pass))
+            .expect("reach-guard: pass applies");
+        let child = child.expect("the first edge is tracked");
+        let extra_root = services.new_search_root();
+
+        for _ in 0..2 {
+            services.exact_decision_context(Some(root), &state);
+            services.exact_decision_context(Some(child), &child_state);
+        }
+        assert_eq!(services.memo_witness.context_builds, 2);
+        assert_eq!(
+            services.memo_witness.context_hits, 2,
+            "reach-guard: the root and the retained child are memoized"
+        );
+        assert_eq!(services.node_contexts.len(), 2);
+
+        let fresh = build_decision_context(&state);
+        for _ in 0..2 {
+            let ctx = services.exact_decision_context(Some(extra_root), &state);
+            assert_eq!(
+                ctx.candidates.len(),
+                fresh.candidates.len(),
+                "a context past the bound is still the exact one"
+            );
+        }
+        assert_eq!(
+            services.memo_witness.context_builds, 4,
+            "a position past the bound is built on every request"
+        );
+        assert_eq!(services.memo_witness.context_hits, 2);
+        assert_eq!(services.node_contexts.len(), 2);
+        assert_eq!(services.memo_witness.peak_node_contexts, 2);
+        assert_eq!(
+            services.memo_witness.peak_node_contexts,
+            services.successor_state_capacity + 1
+        );
     }
 
     /// T6 (hostile): an edge carrying a payment successor returns that state
@@ -4137,6 +4382,8 @@ mod tests {
         assert_eq!(untracked.memo_witness.successor_simulations, 0);
         assert_eq!(untracked.memo_witness.context_hits, 0);
         assert_eq!(untracked.memo_witness.peak_successor_edges, 0);
+        assert_eq!(untracked.memo_witness.peak_retained_states, 0);
+        assert_eq!(untracked.memo_witness.peak_node_contexts, 0);
         let builds = untracked.memo_witness.context_builds;
         assert!(matches!(
             untracked.quiesce_at(None, &state),

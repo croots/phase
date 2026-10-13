@@ -17317,7 +17317,7 @@ one on the bottom of your library.";
         let config = memo_test_config();
         let mut services = PlannerServices::new_default(PlayerId(0), &config, policies);
         if let Some(capacity) = capacity {
-            services.successor_capacity = capacity;
+            services.successor_state_capacity = capacity;
         }
         let ranked = build_root_beam(state, &services);
         assert!(
@@ -17373,18 +17373,34 @@ one on the bottom of your library.";
             "a later rung must reuse the successors an earlier rung simulated"
         );
         assert!(tracked.peak_successor_edges > 0);
+        assert!(tracked.peak_retained_states > 0);
+        assert!(
+            tracked.peak_retained_states <= tracked.peak_successor_edges,
+            "every retained state belongs to a stored edge"
+        );
+        assert!(
+            tracked.peak_node_contexts <= tracked.peak_retained_states + 1,
+            "one context per retained state plus the root"
+        );
         println!(
-            "T7 witness: hits={} simulations={} context_hits={} context_builds={} peak_successor_edges={}",
+            "T7 witness: hits={} simulations={} context_hits={} context_builds={} peak_successor_edges={} peak_retained_states={} peak_node_contexts={}",
             tracked.successor_hits,
             tracked.successor_simulations,
             tracked.context_hits,
             tracked.context_builds,
-            tracked.peak_successor_edges
+            tracked.peak_successor_edges,
+            tracked.peak_retained_states,
+            tracked.peak_node_contexts
         );
 
         let (_, untracked) = deepening_run(&state, policies, Some(0));
         assert_eq!(untracked.successor_hits, 0, "capacity 0 stores no edge");
         assert_eq!(untracked.peak_successor_edges, 0);
+        assert_eq!(untracked.peak_retained_states, 0);
+        assert!(
+            untracked.peak_node_contexts <= 1,
+            "capacity 0 leaves room for the root's context alone"
+        );
     }
 
     /// T8: with the memo in use, the scored list and every search statistic are
@@ -17413,8 +17429,11 @@ one on the bottom of your library.";
             let (tracked, witness) = deepening_run(state, policies, None);
             assert_eq!(tracked, control_a, "{name}: the memo changed the search");
             println!(
-                "T8 {name}: hits={} context_hits={} peak_successor_edges={}",
-                witness.successor_hits, witness.context_hits, witness.peak_successor_edges
+                "T8 {name}: hits={} context_hits={} peak_successor_edges={} peak_retained_states={}",
+                witness.successor_hits,
+                witness.context_hits,
+                witness.peak_successor_edges,
+                witness.peak_retained_states
             );
             tracked_hits += witness.successor_hits;
         }
