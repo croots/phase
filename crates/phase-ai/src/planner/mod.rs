@@ -648,7 +648,8 @@ impl UtilityReducer for SampledReplyUtilityReducer {
 /// Defensive ceiling on the successor edges one decision may memoize.
 ///
 /// One `SearchBudget` allows at most 96 node ticks per rung, a decision runs at
-/// most two rungs and a node expands at most `max_branching` (5) edges, so the
+/// most two rungs with interior search (rung 0 only evaluates the root
+/// candidates) and a node expands at most `max_branching` (5) edges, so the
 /// beam walks roughly 960 edges that the rungs largely share; rollout sampling
 /// and quiescence chains add a handful per leaf. 2048 is half of `TT_CAPACITY`
 /// and is not expected to bind on any preset. Retention is first-come, which

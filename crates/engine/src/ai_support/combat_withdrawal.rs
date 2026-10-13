@@ -690,12 +690,12 @@ mod tests {
         ));
 
         let mut simulated = state.clone();
-        if apply_as_current_for_simulation(&mut simulated, activate_first(source)).is_ok() {
-            assert!(
-                !matches!(simulated.waiting_for, WaitingFor::TargetSelection { .. }),
-                "a draw activation opens no target selection, so no fact can exist"
-            );
-        }
+        apply_as_current_for_simulation(&mut simulated, activate_first(source))
+            .expect("reach-guard: the draw activation applies");
+        assert!(
+            !matches!(simulated.waiting_for, WaitingFor::TargetSelection { .. }),
+            "a draw activation opens no target selection, so no fact can exist"
+        );
     }
 
     /// The filter answers "may" for every placement of the removal effect that
