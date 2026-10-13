@@ -651,8 +651,9 @@ impl UtilityReducer for SampledReplyUtilityReducer {
 ///
 /// Retention is first-come, which keeps the shallow edges every rung
 /// re-walks. Once the ceiling is reached an edge is simulated on every visit
-/// and its child is untracked, which is exactly the path search took before
-/// the memo existed, so the ceiling changes cost and never the result.
+/// and its child is untracked, which yields the same states search produced
+/// before the memo existed (a quiescence chain leaving the tracked region pays
+/// one extra state clone), so the ceiling changes cost and never the result.
 ///
 /// 16 is a measured choice, not a derived one. Workload: `ai-duel`, profiling
 /// build, Hard, red against green, seed 7, `--batch 4`, compared with the
