@@ -6678,28 +6678,216 @@ fn bucket_effects_by_layer(
     effects
 }
 
+/// Which modifications a gather pass keeps.
+#[derive(Clone, Copy)]
+enum ModificationAdmission {
+    /// Keep everything (the full gather).
+    Every,
+    /// Keep only modifications the total predicate accepts. The predicate must
+    /// be decidable for every variant; in particular it must never call
+    /// `ContinuousModification::layer()`, which is unreachable for the
+    /// never-layered and combat-assignment variants.
+    Matching(fn(&ContinuousModification) -> bool),
+}
+
+impl ModificationAdmission {
+    /// Whether the pass keeps an effect whose own modification is `modification`.
+    fn admits(self, modification: &ContinuousModification) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(keep) => keep(modification),
+        }
+    }
+
+    /// Whether gathering `modification` can yield a kept effect: either the
+    /// modification itself is kept, or it is a `GrantStaticAbility` whose
+    /// expansion would synthesize at least one kept child. One level is enough
+    /// because `expand_granted_static_effects` does not recurse into a nested
+    /// grant.
+    fn reaches_admitted(self, modification: &ContinuousModification) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(keep) => {
+                if keep(modification) {
+                    return true;
+                }
+                let ContinuousModification::GrantStaticAbility { definition: inner } = modification
+                else {
+                    return false;
+                };
+                inner.mode == StaticMode::Continuous
+                    && inner
+                        .modifications
+                        .iter()
+                        .any(|granted| !granted_static_expansion_skips(granted) && keep(granted))
+            }
+        }
+    }
+
+    /// Whether any modification of one transient effect can yield a kept
+    /// effect. The full gather answers `true` without scanning, so it reaches
+    /// the liveness check for every stored transient exactly as before.
+    fn reaches_any_admitted(self, modifications: &[ContinuousModification]) -> bool {
+        match self {
+            Self::Every => true,
+            Self::Matching(_) => modifications
+                .iter()
+                .any(|modification| self.reaches_admitted(modification)),
+        }
+    }
+}
+
+/// Whether `expand_granted_static_effects` drops this inner modification before
+/// synthesizing a child for it. Mirrors that function's own skip, so the
+/// admission scan tests the skip first and only then the admission predicate.
+fn granted_static_expansion_skips(modification: &ContinuousModification) -> bool {
+    is_combat_assignment_rule_modification(modification)
+        || matches!(
+            modification,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::Goaded
+            }
+        )
+}
+
+/// Whether a gather evaluated a filter or condition (which can read ambient
+/// call-stack state) or only object-local and definition-local gates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GatherDependence {
+    /// Only object-local and definition-local gates ran, so the result is a
+    /// pure function of the state.
+    Structural,
+    /// A host filter or a transient liveness check ran, so the result may
+    /// depend on the caller's ambient query context.
+    ContextDependent,
+}
+
+/// Proof that a gather pass recorded a `GrantStaticAbility` host walk before
+/// evaluating the host's affected filter.
+struct GrantExpansion(());
+
+/// Proof that a gather pass recorded a transient liveness evaluation before
+/// evaluating the transient's gates.
+struct TransientLiveness(());
+
+/// One gather pass: what it admits and what it has had to evaluate so far.
+struct GatherPass {
+    admission: ModificationAdmission,
+    dependence: GatherDependence,
+}
+
+impl GatherPass {
+    /// A pass that keeps every modification (the full gather).
+    fn every() -> Self {
+        Self {
+            admission: ModificationAdmission::Every,
+            dependence: GatherDependence::Structural,
+        }
+    }
+
+    /// A pass that keeps only the modifications `keep` accepts.
+    fn matching(keep: fn(&ContinuousModification) -> bool) -> Self {
+        Self {
+            admission: ModificationAdmission::Matching(keep),
+            dependence: GatherDependence::Structural,
+        }
+    }
+
+    /// What this pass keeps.
+    fn admission(&self) -> ModificationAdmission {
+        self.admission
+    }
+
+    /// Ends the pass, reporting what it had to evaluate.
+    fn into_dependence(self) -> GatherDependence {
+        self.dependence
+    }
+
+    /// Records that the pass is about to match a grant host's affected filter
+    /// and returns the token that statement requires.
+    fn enter_grant_expansion(&mut self) -> GrantExpansion {
+        self.dependence = GatherDependence::ContextDependent;
+        GrantExpansion(())
+    }
+
+    /// Records that the pass is about to evaluate one transient's liveness and
+    /// returns the token those statements require.
+    fn enter_transient_liveness(&mut self) -> TransientLiveness {
+        self.dependence = GatherDependence::ContextDependent;
+        TransientLiveness(())
+    }
+}
+
+/// The host-filter matcher for a grant expansion inside a gather pass. Taking
+/// the token keeps the filter evaluation unreachable without recording it.
+fn granted_static_host_matches_in_pass<'a>(
+    _entered: &GrantExpansion,
+    state: &'a GameState,
+    parent: &'a ActiveContinuousEffect,
+) -> impl Fn(&ObjectId) -> bool + 'a {
+    granted_static_host_matches(state, parent)
+}
+
+/// The first liveness evaluation for one transient inside a gather pass.
+fn transient_participates_in_pass(
+    _entered: &TransientLiveness,
+    state: &GameState,
+    tce: &TransientContinuousEffect,
+    participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+) -> bool {
+    participates(state, tce)
+}
+
+/// The source-condition gate for one transient inside a gather pass, guarded
+/// by the same token as its liveness evaluation.
+fn transient_source_condition_passes_in_pass(
+    _entered: &TransientLiveness,
+    state: &GameState,
+    tce: &TransientContinuousEffect,
+    condition: &StaticCondition,
+) -> bool {
+    source_condition_gate_passes(state, condition, tce.controller, tce.source_id)
+}
+
+/// Gathers every continuous effect that is active independently of any one
+/// recipient: functioning statics, live transients, and the Ring emblem.
 pub(crate) fn collect_shared_active_continuous_effects(
     state: &GameState,
 ) -> Vec<ActiveContinuousEffect> {
-    collect_continuous_effects(state, gather_transient_continuous_effects)
+    collect_continuous_effects(state, transient_effect_is_live, &mut GatherPass::every())
+}
+
+/// The shared gather narrowed to the modifications `keep` accepts, in the same
+/// relative order as [`collect_shared_active_continuous_effects`]. Work whose
+/// every output would be dropped is skipped, and the returned
+/// [`GatherDependence`] says whether what remained had to evaluate a filter or
+/// a condition. `keep` must be total (see [`ModificationAdmission::Matching`]).
+pub(crate) fn collect_shared_active_continuous_effects_matching(
+    state: &GameState,
+    keep: fn(&ContinuousModification) -> bool,
+) -> (Vec<ActiveContinuousEffect>, GatherDependence) {
+    let mut pass = GatherPass::matching(keep);
+    let effects = collect_continuous_effects(state, transient_effect_is_live, &mut pass);
+    (effects, pass.into_dependence())
 }
 
 /// CR 611.2b + CR 613.1: installed state durations participate while deriving
 /// the candidate board. Their irreversible end is checked only after every
 /// layer has settled, never against a temporarily reset controller or P/T.
 fn collect_derivation_continuous_effects(state: &GameState) -> Vec<ActiveContinuousEffect> {
-    collect_continuous_effects(state, |state, effects| {
-        gather_transient_continuous_effects_with(
-            state,
-            effects,
-            transient_effect_passes_other_gates,
-        );
-    })
+    collect_continuous_effects(
+        state,
+        transient_effect_passes_other_gates,
+        &mut GatherPass::every(),
+    )
 }
 
+/// Runs one gather pass: static sources, then transients admitted by
+/// `transient_participates`, then the Ring emblem.
 fn collect_continuous_effects(
     state: &GameState,
-    gather_transients: fn(&GameState, &mut Vec<ActiveContinuousEffect>),
+    transient_participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     #[cfg(test)]
     record_active_effect_collection();
@@ -6707,17 +6895,27 @@ fn collect_continuous_effects(
     let mut effects = Vec::new();
 
     for_each_static_effect_source(state, |state, obj| {
-        effects.extend(active_continuous_effects_from_static_source(state, obj));
+        effects.extend(static_source_effects_in_pass(state, obj, pass));
     });
-    gather_transients(state, &mut effects);
-    gather_ring_emblem_continuous_effects(state, &mut effects);
+    gather_transient_continuous_effects_with(state, &mut effects, transient_participates, pass);
+    gather_ring_emblem_continuous_effects(state, &mut effects, pass.admission());
     effects
 }
 
+/// Appends the Ring emblem's legendary effect for each Ring-bearer, unless the
+/// pass does not keep that modification.
 fn gather_ring_emblem_continuous_effects(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
+    admission: ModificationAdmission,
 ) {
+    // The only modification produced here; a pass that drops it reads no ring
+    // state at all.
+    if !admission.admits(&ContinuousModification::AddSupertype {
+        supertype: Supertype::Legendary,
+    }) {
+        return;
+    }
     for &player in state.ring_level.keys() {
         let Some(bearer_id) = super::effects::ring::ring_bearer_for(state, player) else {
             continue;
@@ -6881,9 +7079,21 @@ pub(crate) fn for_each_static_effect_source(
     }
 }
 
+/// The continuous effects one source's live static definitions contribute to
+/// the full gather.
 pub(crate) fn active_continuous_effects_from_static_source(
     state: &GameState,
     source: &crate::game::game_object::GameObject,
+) -> Vec<ActiveContinuousEffect> {
+    static_source_effects_in_pass(state, source, &mut GatherPass::every())
+}
+
+/// The continuous effects one source's live static definitions contribute to
+/// `pass`.
+fn static_source_effects_in_pass(
+    state: &GameState,
+    source: &crate::game::game_object::GameObject,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     // CR 613.7n: a static ability's continuous effect inherits `source.timestamp`,
     // which is the object's battlefield-entry timestamp drawn in `move_to_zone`
@@ -6900,12 +7110,18 @@ pub(crate) fn active_continuous_effects_from_static_source(
         source.timestamp,
         source.static_definitions.as_slice(),
         StaticZoneAdmission::LiveSource,
+        pass,
     )
 }
 
+/// The continuous effects an object's own base static definitions contribute
+/// to an off-zone keyword query about that object, narrowed to the
+/// modifications `keep` accepts. These effects are per object and never
+/// shared, so the pass's dependence is not reported.
 pub(crate) fn active_continuous_effects_from_base_static_source(
     state: &GameState,
     source: &crate::game::game_object::GameObject,
+    keep: fn(&ContinuousModification) -> bool,
 ) -> Vec<ActiveContinuousEffect> {
     let static_definitions: Vec<StaticDefinition> = source
         .base_static_definitions
@@ -6920,6 +7136,7 @@ pub(crate) fn active_continuous_effects_from_base_static_source(
         source.timestamp,
         &static_definitions,
         StaticZoneAdmission::PreFilteredBaseStatic,
+        &mut GatherPass::matching(keep),
     )
 }
 
@@ -6984,6 +7201,10 @@ enum StaticZoneAdmission {
     PreFilteredBaseStatic,
 }
 
+/// Builds the continuous effects of `static_definitions` that `pass` keeps,
+/// expanding each `GrantStaticAbility` over its current battlefield hosts.
+/// `admission` says which zone-of-function screening the caller already
+/// applied (see [`StaticZoneAdmission`]).
 fn active_continuous_effects_from_static_definitions(
     state: &GameState,
     source_id: ObjectId,
@@ -6991,6 +7212,7 @@ fn active_continuous_effects_from_static_definitions(
     timestamp: u64,
     static_definitions: &[StaticDefinition],
     admission: StaticZoneAdmission,
+    pass: &mut GatherPass,
 ) -> Vec<ActiveContinuousEffect> {
     let mut effects = Vec::new();
     let source_obj = state.objects.get(&source_id);
@@ -7052,6 +7274,13 @@ fn active_continuous_effects_from_static_definitions(
             {
                 continue;
             }
+            // A narrowed pass drops, before any further work, a modification
+            // that can yield no kept effect. This runs after the skip above
+            // and before `layer()` below, and uses only the pass's total
+            // predicate.
+            if !pass.admission().reaches_admitted(modification) {
+                continue;
+            }
             let trigger_producer_origin =
                 state
                     .objects
@@ -7099,6 +7328,7 @@ fn active_continuous_effects_from_static_definitions(
             // `append_late_granted_static_effects`, and application gates every
             // child through `granted_static_parent_qualifies`.
             if let ContinuousModification::GrantStaticAbility { definition: inner } = modification {
+                let entered = pass.enter_grant_expansion();
                 effects.extend(expand_granted_static_effects(
                     state,
                     source_id,
@@ -7109,14 +7339,19 @@ fn active_continuous_effects_from_static_definitions(
                         .battlefield
                         .iter()
                         .copied()
-                        .filter(granted_static_host_matches(state, &effect)),
+                        .filter(granted_static_host_matches_in_pass(
+                            &entered, state, &effect,
+                        )),
+                    pass.admission(),
                 ));
                 // Continue: also push the meta-effect below so layer-6 apply
                 // pushes the inner static onto the recipient's
                 // `static_definitions` for inspectability and downstream
                 // queries (e.g., parser/coverage walks).
             }
-            effects.push(effect);
+            if pass.admission().admits(modification) {
+                effects.push(effect);
+            }
         }
     }
 
@@ -7157,6 +7392,10 @@ fn active_continuous_effects_from_static_definitions(
 /// `depends_on` would suppress the cross-grant edge between them as if they were one
 /// static. No known card grants two such interacting static abilities to the same
 /// recipient; documented here for the next maintainer who hits that case.
+///
+/// `admission` narrows the synthesized children to the inner modifications the
+/// calling gather pass keeps; the late-grant path passes
+/// `ModificationAdmission::Every`.
 fn expand_granted_static_effects(
     state: &GameState,
     host_source_id: ObjectId,
@@ -7164,6 +7403,7 @@ fn expand_granted_static_effects(
     inner: &StaticDefinition,
     host_origin: Option<TriggerProducerOrigin>,
     recipients: impl IntoIterator<Item = ObjectId>,
+    admission: ModificationAdmission,
 ) -> Vec<ActiveContinuousEffect> {
     if inner.mode != StaticMode::Continuous {
         return Vec::new();
@@ -7198,6 +7438,11 @@ fn expand_granted_static_effects(
                     }
                 )
             {
+                continue;
+            }
+            // After the skip above and before `layer()` below: a narrowed
+            // pass synthesizes no child for a modification it does not keep.
+            if !admission.admits(modification) {
                 continue;
             }
             out.push(ActiveContinuousEffect {
@@ -7657,6 +7902,7 @@ fn append_late_granted_static_effects(
                 inner,
                 parent.trigger_producer_origin.clone(),
                 candidates,
+                ModificationAdmission::Every,
             )
             .into_iter()
             .filter(move |child| {
@@ -7981,25 +8227,43 @@ fn transient_effect_passes_other_gates(state: &GameState, tce: &TransientContinu
     true
 }
 
+/// Appends the effects of every live transient continuous effect (the full
+/// transient gather).
 pub(crate) fn gather_transient_continuous_effects(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
 ) {
-    gather_transient_continuous_effects_with(state, effects, transient_effect_is_live);
+    gather_transient_continuous_effects_with(
+        state,
+        effects,
+        transient_effect_is_live,
+        &mut GatherPass::every(),
+    );
 }
 
+/// Appends the effects of every stored transient that `participates` admits
+/// and `pass` keeps. A narrowed pass skips, before any liveness evaluation, a
+/// transient none of whose modifications can yield a kept effect.
 fn gather_transient_continuous_effects_with(
     state: &GameState,
     effects: &mut Vec<ActiveContinuousEffect>,
     participates: fn(&GameState, &TransientContinuousEffect) -> bool,
+    pass: &mut GatherPass,
 ) {
     for tce in &state.transient_continuous_effects {
-        if !participates(state, tce) {
+        // Scans the raw modification list with the pass's total predicate
+        // only. It over-approximates: a modification the per-modification
+        // skips below would drop still lets the transient through.
+        if !pass.admission().reaches_any_admitted(&tce.modifications) {
+            continue;
+        }
+        let entered = pass.enter_transient_liveness();
+        if !transient_participates_in_pass(&entered, state, tce, participates) {
             continue;
         }
 
         let retained_condition = if let Some(condition) = &tce.condition {
-            if !source_condition_gate_passes(state, condition, tce.controller, tce.source_id) {
+            if !transient_source_condition_passes_in_pass(&entered, state, tce, condition) {
                 continue;
             }
             condition_uses_recipient_context(condition).then(|| condition.clone())
@@ -8049,6 +8313,11 @@ fn gather_transient_continuous_effects_with(
             ) {
                 continue;
             }
+            // After both skips above and before `layer()` below: a narrowed
+            // pass drops a modification that can yield no kept effect.
+            if !pass.admission().reaches_admitted(modification) {
+                continue;
+            }
             let effect = ActiveContinuousEffect {
                 source_id: tce.source_id,
                 controller: tce.controller,
@@ -8074,6 +8343,7 @@ fn gather_transient_continuous_effects_with(
             // modifications to recipients during the same layer pass (Roar of the
             // Fifth People chapter II: saga gains "Creatures you control have …").
             if let ContinuousModification::GrantStaticAbility { definition: inner } = modification {
+                let expansion = pass.enter_grant_expansion();
                 effects.extend(expand_granted_static_effects(
                     state,
                     tce.source_id,
@@ -8084,10 +8354,15 @@ fn gather_transient_continuous_effects_with(
                         .battlefield
                         .iter()
                         .copied()
-                        .filter(granted_static_host_matches(state, &effect)),
+                        .filter(granted_static_host_matches_in_pass(
+                            &expansion, state, &effect,
+                        )),
+                    pass.admission(),
                 ));
             }
-            effects.push(effect);
+            if pass.admission().admits(modification) {
+                effects.push(effect);
+            }
         }
     }
 }
@@ -9917,6 +10192,7 @@ fn original_granted_static_parent(
                 state,
                 &mut effects,
                 transient_effect_passes_other_gates,
+                &mut GatherPass::every(),
             );
             effects
         }
