@@ -218,9 +218,6 @@ impl ObjectMap {
             .filter(|(id, object)| needs(id, object))
             .map(|(id, _)| *id)
             .collect();
-        if matching.is_empty() {
-            return;
-        }
         for id in &matching {
             if let Some(object) = self.get_mut(id) {
                 update(id, object);
