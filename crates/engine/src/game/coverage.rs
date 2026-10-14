@@ -2223,6 +2223,7 @@ fn fmt_player_filter(pf: &PlayerFilter) -> String {
             (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 "each opponent this source attacked this combat"
             }
+            (AttackSubject::EventAttackers, _) => "each player those attackers attacked",
         },
         PlayerFilter::OpponentAttackingEnchantedPlayer => {
             "each opponent attacking the enchanted player"
@@ -17517,6 +17518,7 @@ have been revealed, Aggressive Detective deals 2 damage to each opponent.";
                     target: TargetFilter::Any,
                     source_rider: Some(CounterSourceRider::LosesAbilities {
                         static_def: Box::new(static_def()),
+                        source_filter: None,
                         duration: Box::new(Duration::UntilHostLeavesPlay),
                     }),
                     countered_spell_zone: None,
