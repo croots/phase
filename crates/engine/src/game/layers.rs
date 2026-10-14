@@ -6719,7 +6719,7 @@ impl ModificationAdmission {
                     && inner
                         .modifications
                         .iter()
-                        .any(|granted| !granted_static_expansion_skips(granted) && keep(granted))
+                        .any(|granted| !continuous_gather_skips(granted) && keep(granted))
             }
         }
     }
@@ -6737,10 +6737,13 @@ impl ModificationAdmission {
     }
 }
 
-/// Whether `expand_granted_static_effects` drops this inner modification before
-/// synthesizing a child for it. Mirrors that function's own skip, so the
-/// admission scan tests the skip first and only then the admission predicate.
-fn granted_static_expansion_skips(modification: &ContinuousModification) -> bool {
+/// Whether the continuous-effect gather drops this modification before
+/// producing an effect for it. The single skip predicate shared by the static
+/// loop (top-level modifications), `expand_granted_static_effects` (a granted
+/// definition's inner modifications) and the admission scan in
+/// `ModificationAdmission::reaches_admitted`, which tests it before the
+/// admission predicate.
+fn continuous_gather_skips(modification: &ContinuousModification) -> bool {
     is_combat_assignment_rule_modification(modification)
         || matches!(
             modification,
@@ -7264,14 +7267,7 @@ fn active_continuous_effects_from_static_definitions(
         for (mod_index, modification) in def.modifications.iter().enumerate() {
             // CR 701.15b: Goaded is a designation, not an ability granted
             // to the affected permanent. Combat reads this functioning source.
-            if is_combat_assignment_rule_modification(modification)
-                || matches!(
-                    modification,
-                    ContinuousModification::AddStaticMode {
-                        mode: StaticMode::Goaded
-                    }
-                )
-            {
+            if continuous_gather_skips(modification) {
                 continue;
             }
             // A narrowed pass drops, before any further work, a modification
@@ -7430,14 +7426,7 @@ fn expand_granted_static_effects(
         // preceding layers have established that controller.
         let retained_inner_condition = inner.condition.clone();
         for (mod_index, modification) in inner.modifications.iter().enumerate() {
-            if is_combat_assignment_rule_modification(modification)
-                || matches!(
-                    modification,
-                    ContinuousModification::AddStaticMode {
-                        mode: StaticMode::Goaded
-                    }
-                )
-            {
+            if continuous_gather_skips(modification) {
                 continue;
             }
             // After the skip above and before `layer()` below: a narrowed

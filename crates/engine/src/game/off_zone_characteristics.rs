@@ -1931,20 +1931,24 @@ mod tests {
     use crate::game::layers::collect_shared_active_continuous_effects;
     use crate::types::statics::StaticMode;
 
+    /// Flashback whose cost is the card's own mana cost.
     fn flashback() -> Keyword {
         Keyword::Flashback(FlashbackCost::Mana(ManaCost::SelfManaCost))
     }
 
+    /// A filter matching any card in a graveyard.
     fn graveyard_cards() -> TargetFilter {
         TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::InAnyZone {
             zones: vec![Zone::Graveyard],
         }]))
     }
 
+    /// An admission predicate that keeps every modification.
     fn admit_every(_: &ContinuousModification) -> bool {
         true
     }
 
+    /// The `Debug` rendering of each effect, in order.
     fn debug_each(effects: &[ActiveContinuousEffect]) -> Vec<String> {
         effects.iter().map(|effect| format!("{effect:?}")).collect()
     }
@@ -1959,6 +1963,7 @@ mod tests {
             .collect()
     }
 
+    /// Appends `definition` to `source`'s `static_definitions`.
     fn push_static(state: &mut GameState, source: ObjectId, definition: StaticDefinition) {
         state
             .objects
@@ -1968,16 +1973,19 @@ mod tests {
             .push(definition);
     }
 
+    /// A continuous static whose only modification adds `keyword` to `affected`.
     fn keyword_static(affected: TargetFilter, keyword: Keyword) -> StaticDefinition {
         StaticDefinition::continuous()
             .affected(affected)
             .modifications(vec![ContinuousModification::AddKeyword { keyword }])
     }
 
+    /// No definition index and no transient id: how these tests spot a grant-expansion child.
     fn is_grant_child(effect: &ActiveContinuousEffect) -> bool {
         effect.def_index.is_none() && effect.transient_id.is_none()
     }
 
+    /// The ids of every object not on the battlefield, sorted.
     fn off_battlefield_ids(state: &GameState) -> Vec<ObjectId> {
         let mut ids: Vec<ObjectId> = state
             .objects
@@ -1989,12 +1997,14 @@ mod tests {
         ids
     }
 
+    /// `effective_off_zone_keywords` for each id, in order.
     fn keywords_of_each(state: &GameState, ids: &[ObjectId]) -> Vec<Vec<Keyword>> {
         ids.iter()
             .map(|id| effective_off_zone_keywords(state, *id))
             .collect()
     }
 
+    /// The keyword-filtered gather equals the full gather narrowed by the keyword predicate.
     #[test]
     fn keyword_filtered_gather_is_bit_identical_to_full_gather() {
         let mut state = GameState::new_two_player(42);
@@ -2228,6 +2238,7 @@ mod tests {
         (state, source, bear)
     }
 
+    /// With no keyword effect on the board the filtered gather is empty and `Structural`.
     #[test]
     fn keyword_filtered_gather_skips_non_keyword_work() {
         let (state, _, _) = non_keyword_board();
@@ -2249,6 +2260,7 @@ mod tests {
         assert_eq!(dependence, GatherDependence::Structural);
     }
 
+    /// A keyword transient or keyword-inner grant makes the filtered gather `ContextDependent`.
     #[test]
     fn keyword_relevant_transient_or_grant_marks_gather_context_dependent() {
         // A live keyword transient.
@@ -2414,6 +2426,7 @@ mod tests {
         state
     }
 
+    /// Whether any effect's own modification is `AddKeyword` of `flashback()`.
     fn carries_sibling_keyword(effects: &[ActiveContinuousEffect]) -> bool {
         effects.iter().any(|effect| {
             matches!(
@@ -2423,6 +2436,7 @@ mod tests {
         })
     }
 
+    /// Whether any effect's own top-level modification is the same variant as `hostile`.
     fn carries_same_variant(
         effects: &[ActiveContinuousEffect],
         hostile: &ContinuousModification,
@@ -2432,6 +2446,7 @@ mod tests {
         })
     }
 
+    /// A hostile modification ahead of an `AddKeyword` is dropped; the keyword is still gathered.
     #[test]
     fn keyword_admission_is_total_at_every_gather_position() {
         use crate::types::counter::CounterType;
@@ -2618,6 +2633,7 @@ mod tests {
         (keywords, off_zone_keyword_scope_counts())
     }
 
+    /// A keyword transient makes scoped queries fall open, with results equal to unscoped ones.
     #[test]
     fn scope_falls_open_on_keyword_relevant_transient() {
         let (mut state, source, cards) = sharing_board();
@@ -2651,6 +2667,7 @@ mod tests {
         );
     }
 
+    /// A keyword-inner granted static makes scoped queries fall open, with unscoped results.
     #[test]
     fn scope_falls_open_on_keyword_relevant_static_grant() {
         let (mut state, source, cards) = sharing_board();
@@ -2687,6 +2704,7 @@ mod tests {
         );
     }
 
+    /// A query on a clone made inside a scope is unmatched and returns the clone's own result.
     #[test]
     fn scope_does_not_serve_a_cloned_state() {
         let (state, source, cards) = sharing_board();
@@ -2719,6 +2737,7 @@ mod tests {
         assert_ne!(cloned, original_second);
     }
 
+    /// Same-state nesting adds no frame, another state adds one, and an unwind pops its frame.
     #[test]
     fn nested_scopes_and_unwind_leave_stack_empty() {
         let (state, _, cards) = sharing_board();
@@ -2771,6 +2790,7 @@ mod tests {
         assert_eq!(off_zone_keyword_scope_depth(), 0);
     }
 
+    /// Scoped equals unscoped under self-reference and nested queries; a held slice stays unchanged.
     #[test]
     fn recursion_guard_and_reentrancy_inside_scope() {
         // (a) "Cards in your graveyard without foretell have foretell."
@@ -2916,6 +2936,7 @@ mod tests {
         assert_eq!(off_zone_keyword_scope_depth(), 0);
     }
 
+    /// A scoped query clones only its applicable shared effects; an unscoped query clones none.
     #[test]
     fn shared_slice_clones_only_applicable_effects() {
         let (state, _, cards) = sharing_board();
@@ -2952,6 +2973,7 @@ mod tests {
         });
     }
 
+    /// Emblem, face-down, phased-out and self-grant boards agree inside and outside a scope.
     #[test]
     fn hostile_fixtures_agree_inside_and_outside_a_scope() {
         /// Compares every off-battlefield object's keywords inside one scope

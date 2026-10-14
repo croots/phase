@@ -43343,6 +43343,7 @@ pub mod tests {
         }
     }
 
+    /// Creates player 0's "Off-Zone Card {index}" in `zone` with card id `8300 + index`.
     fn off_zone_test_card(state: &mut GameState, index: u64, zone: Zone) -> ObjectId {
         create_object(
             state,
@@ -43353,6 +43354,7 @@ pub mod tests {
         )
     }
 
+    /// The graveyard trigger-source scan fills the keyword scope once and matches per-id results.
     #[test]
     fn graveyard_trigger_scan_shares_one_keyword_gather() {
         use crate::game::off_zone_characteristics::{
@@ -43389,6 +43391,7 @@ pub mod tests {
         assert_eq!(scanned, expected);
     }
 
+    /// Off-zone trigger reconciliation fills the keyword scope once and matches unscoped results.
     #[test]
     fn reconcile_shares_one_keyword_gather() {
         use crate::game::off_zone_characteristics::{
@@ -43396,6 +43399,7 @@ pub mod tests {
             reset_off_zone_keyword_scope_counts,
         };
 
+        /// The `Debug` rendering of each of `obj`'s `KeywordCompanion` trigger entries.
         fn keyword_companion_entries(obj: &GameObject) -> Vec<String> {
             obj.trigger_definitions
                 .iter_all()
